@@ -1,0 +1,158 @@
+# GenieZone (gz) — 从 EL1 到 EL2 的分析结果
+
+设备：Lenovo TB337FC，MT8786V/N，Android 13，kernel 4.19.191，已 root（magisk）。
+以下全部来自只读 dump，设备未做任何写入。
+
+## 一、镜像格式（已确认）
+
+`gz_a` / `lk_a` / `gz_b` 共用同一容器：
+
+```
+0x000  u32 magic   0x58881688
+0x004  u32 total   payload 结束偏移（也是证书区起点）
+0x008  char[4]     "gz" / "lk"    ← 这个字段就是分区名，不是 gzip
+0x028  u32         0xffffffff
+0x030  u32 magic   0x58891689     (= 前一个 magic + 0x10001)
+0x034  u32         0x200          payload 起点的页对齐偏移
+0x038  u32         1
+0x044  u32         0x10
+0x050  ...        0xff 填充，一直填到 0x200
+0x200  ...         payload
+total  ...         签名 + X.509 证书区
+```
+
+实测三份：
+
+| 镜像 | total | name | payload 长度 | payload 熵 | 证书区首个 DER |
+| --- | --- | --- | --- | --- | --- |
+| gz_a | 0x28e5f0 | gz | 2679792 | 8.000 | 0x28e9f0 |
+| lk_a | 0x115e70 | lk | 1137776 | 5.837 | 0x116270 |
+
+`gz_a` 的证书区里是明文 DER，RSA-2048，`C=AU / O=Mediatek / Some-State`，
+2015-06-04 → 2035-06-04，全篇 58 处 `30 82`。所以 payload 不是整体加密。
+
+## 二、内核符号（vmlinux 已重建）
+
+`boot_a.img` → `ANDROID!`，kernel 10857007 字节 gzip → 25815040 字节。
+`vmlinux-to-elf` 恢复 58703 个符号，基址 `ffffff8008080000`。
+
+`gz_*` 共 39 个，关键地址：
+
+```
+ffffff800871ec4c  gz_ioctl
+ffffff800871ec64  gz_compat_ioctl
+ffffff800871ec80  gz_dev_open
+ffffff800871ed4c  gz_dev_release
+ffffff800871ee3c  _gz_ioctl
+ffffff800871e974  gz_manual_adjust_trusty_wq_attr
+ffffff80087227a0  _gz_client_cmd
+ffffff80087228a4  _gz_client_wait_ret
+ffffff80087229a4  GZ_RewriteParamMemAddr
+ffffff8008722b78  _Gz_KreeServiceCall_body
+ffffff8008722da4  _GzServiceCall_body
+ffffff800872321c  GZ_CopyMemToBuffer
+ffffff800872dd54  gz_log_page_init
+ffffff800872e494  gz_log_read
+ffffff800872e740  gz_log_poll
+ffffff800872e7c4  gz_log_open
+ffffff800872e80c  gz_log_release
+ffffff8009610cb0  gz_init
+ffffff8009611000  gz_log_context_init
+```
+
+## 三、ioctl 命令表（从 `_gz_ioctl` 反汇编读出）
+
+入口在 `_gz_ioctl`，先 `and w9, w1, #0xff00` 再和 `0x5400` 比，
+所以命令号低字节是子命令、第 8..15 位是类型：
+
+```
+0xc0105401   → _gz_ioctl+0x260
+0xc0105402   → _gz_ioctl+0x340
+0xc0205403   → _gz_ioctl+0x480   走 copy_from_user(32)
+0xc0205404   → _gz_ioctl+0x4f4
+0x40085415   → _gz_ioctl+0xa8    直接调 gz_manual_adjust_trusty_wq_attr
+0x00005410   → _gz_ioctl+0x434
+0x00005411   → _gz_ioctl+0x3f4
+```
+
+所有 `0xc0…` 分支在进入前都会：
+1. `mrs x27, sp_el0` 取当前 task
+2. 用 `task->addr_limit` 做 access_ok 检查（`sbcs` / `cset ls`）
+3. `__arch_copy_from_user(sp+0x20, arg, 32)`
+
+也就是每条命令都从用户态拷一个 32 字节结构体进来，然后原样往 EL2 送。
+
+## 四、第一个可疑点：GZ_RewriteParamMemAddr
+
+这个函数的职责是把传入结构体里的参数指针，逐个重写成指向
+"本地影子数组"的指针，然后再交给 `_Gz_KreeServiceCall_body`：
+
+```
+ldr  w8, [x0, #16]          ; 4 个参数类型，每字节一个
+and  w9, w8, #0xff          ; 参数0 类型
+sub  w9, w9, #5
+cmp  w9, #2
+b.cs → 跳过（类型 <5 或 >6 视为无参）
+ldr  w9, [x0, #48]          ; 参数0 长度
+add  x10, x0, #0x68
+str  x10, [x0, #40]         ; ← 把指针改写成 buf+0x68
+```
+
+三个参数依次用 `ubfx w8, #8, #8`、`#16, #8`、`lsr #24` 取类型，
+指针分别写进 `[x0+40]`、`[x0+56]`、`[x0+72]`，长度累加进 `w9`，
+每次累加前检查 `cmp w9, #0x3ff`（1023）。
+
+**问题**：`0x3ff` 这个上界是拿"当前累加值"去比的，不是"累加值 + 本次长度"。
+`w9 = w9 + w10` 发生在 `cmp` 之后，所以最后一次加法可以把 `w9` 顶过 1024。
+影子数组 `buf+0x68` 到 `buf+0x68+0x400` 一共 1024 字节，越界写指针不落在
+影子数组里，而是落进结构体后面的字段——这些字段紧接着被当作参数交给 EL2。
+
+这是 EL1 侧的整数边界缺陷，触发点在 `ioctl(fd_gz_kree, 0xc0205403, &arg)`。
+
+## 五、第二个可疑点：SMC 汇聚
+
+全内核 20 处 `smc #0`，集中在 `ffffff80080962xx`–`ffffff80080976xx`，
+是 `arm64_ssbd` / `spectre` 那批 mitigation 代码，不是 GZ 的通道。
+GZ 的调用链 `_GzServiceCall_body` / `_Gz_KreeServiceCall_body` 里
+没有内联 `smc`，说明它最终经由一个函数指针或 `mtk_secure` 的封装间接下发，
+需要继续跟 `_GzServiceCall_body` 的调用者才能定位到真正的 SMC 站点。
+
+## 六、内核配置
+
+```
+CONFIG_MTK_ENABLE_GENIEZONE=y
+CONFIG_HAVE_MTK_ENABLE_GENIEZONE=y
+CONFIG_MTK_GZ_MAIN=y
+CONFIG_MTK_GZ_KREE=y
+CONFIG_MTK_GZ_LOG=y
+CONFIG_MTK_GZ_IRQ=y
+CONFIG_MTK_GZ_VIRTIO=y
+CONFIG_MTK_GZ_VIRTIO_IPC=y
+CONFIG_MTK_SECURE_MEM_SUPPORT=y
+CONFIG_MTK_CAM_GENIEZONE_SUPPORT=y
+CONFIG_KALLSYMS=y
+# CONFIG_KALLSYMS_ALL is not set
+```
+
+设备节点：`/dev/gz_kree`（char 10:58，`system:camera`）。
+`/proc/kallsyms` 名字全在但地址全 0，所以符号必须从 `boot_a` 里恢复。
+
+## 七、待补
+
+- `_GzServiceCall_body` → SMC 的真实站点（继续向下跟调用图）
+- `md1img_a`（TEE / microtrust），确定 EL2 与 EL3 的分工
+- `dtbo_a` 里的 GZ 保留内存区
+- `gz_a` payload 内的压缩段：熵 8.0 但含明文 DER，需按 MTK GZ 的
+  段表（`0x30` TOC）切分，不是靠通用解压器
+
+## 八、产物
+
+```
+boot_a.img          33554432  1e608e588005fce70a9dff9d52dae073
+dtbo_a.img           8388608  dde21272241747126b0faf92bb3cc9d4
+lk_a.img             2097152  6d304c59565d1bf358511ab982e6237b
+preloader_a.img      4194304  678b7f3a15cbe3839834e0ab42c21b29
+config.gz              33280
+Image               25815040  (gzip 解压后的 kernel)
+vmlinux.elf         58703 symbols, base ffffff8008080000
+```
