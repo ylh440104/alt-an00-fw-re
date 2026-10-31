@@ -460,7 +460,143 @@ EL2 里带着自测代码，入口在 `0x3803ea34` 和 `0x3803ed9c`。
 "unmap" 这个名字暗示它是**被 unmap 掉的内存区域描述**，
 可能对应 EL2 里做 stage-2 反映射的逻辑。等能读到 EL2 内存后再看。
 
-## 十五、待补
+## 十五、EL1 侧内存访问原语实测（全部只读，设备未修改）
+
+目标：验证"RKP 未启用是否导致 EL2 数据暴露给 EL1"。
+
+### 结果：无法验证，因为 EL1 根本读不到物理内存
+
+| 原语 | 状态 |
+| --- | --- |
+| `/dev/mem` | 不存在，且 `# CONFIG_DEVMEM is not set` |
+| `/dev/kmem` | 不存在 |
+| `/proc/kcore` | 不存在，且 `# CONFIG_PROC_KCORE is not set` |
+| `/sys/kernel/debug` | 不存在，`mount -t debugfs` 报 `No such file or directory` |
+| `mknod /dev/mem_test c 1 1` | 节点能建，但 `dd` 读报 `Permission denied` |
+
+关键：**`CONFIG_DEVMEM` 是编译期关闭的**，不是权限问题。
+即使用 root + magisk 域手动 `mknod`，内核也根本没有 `/dev/mem` 的
+字符设备实现。这条路不是"被拦住"，是"不存在"。
+
+同时 `CONFIG_MTK_DEVMPU` 和 `CONFIG_MTK_DEVMPU_EMI` 都未设置，
+说明不是靠 DEVMPU 挡的，而是单纯没编进去。
+
+### 仍然可用的只读通道
+
+```
+dmesg              可用（内核环形缓冲）
+/dev/kmsg          可用（root）
+/proc/kallsyms     可用，但地址全 0（CONFIG_KALLSYMS_ALL 未设）
+/proc/gz_log       曾可用，一次性，现已耗尽
+/proc/config.gz    可用
+```
+
+`CONFIG_SECURITY_DMESG_RESTRICT` 未设置，所以 `dmesg` 对普通 shell 也可读。
+
+### 相关内核配置（实测）
+
+```
+# CONFIG_DEVMEM is not set
+# CONFIG_PROC_KCORE is not set
+CONFIG_ARCH_PROC_KCORE_TEXT=y
+# CONFIG_KALLSYMS_ALL is not set
+# CONFIG_SECURITY_DMESG_RESTRICT is not set
+CONFIG_MTK_M4U=y
+CONFIG_MTK_TEE_GP_SUPPORT=y
+CONFIG_MTK_TEE_SANITY=y
+CONFIG_TRUSTY_INTERRUPT_MAP=y
+CONFIG_TRUSTY_INTERRUPT_FIQ_ONLY=y
+# CONFIG_MTK_IOMMU is not set
+# CONFIG_MTK_IOMMU_V2 is not set
+# CONFIG_MTK_DEVMPU is not set
+# CONFIG_MTK_DEVMPU_EMI is not set
+# CONFIG_OPTEE is not set
+```
+
+## 十六、TEE 运行时实例（实测进程表）
+
+```
+ 60-67  [id0_trusty_n/0..7]     8 个 normal world 入口线程
+ 68     [trusty_poll_tas]
+222-224 [id0_trusty_k/0..2]     3 个 kernel world 线程
+225     [id0_trusty_c/0]
+288     [teei_switch_thr]
+289     [teei_bdrv_threa]
+290     [teei_log_thread]
+449     teei_daemon               用户态服务（uid system）
+```
+
+设备节点：
+
+```
+crw-rw---- system system 250, 0  /dev/trusty-ipc-dev0
+crw-rw---- system system 502, 0  /dev/teei_client
+crw-rw---- system system 501, 0  /dev/teei_config
+crw-rw---- system root   499, 0  /dev/teei_fp
+crw-rw---- system camera  10,58  /dev/gz_kree
+```
+
+`id0_trusty_*` 这个命名说明 TEE 实例 id 是 0，与 DTB 里 `trusty { tee-id = <0x00>; }` 一致。
+
+### `teei_daemon` 在持续刷错误
+
+`dmesg` 里 `tz_vfs_read: wait_for_completion was interrupt` 反复出现，
+累计 19 次，间隔约 1 秒：
+
+```
+[45370.856693] [tz_vfs][ERROR]: [tz_vfs_read][155] wait_for_completion was interrupt
+[45372.168549] ...
+[45373.080668] ...
+```
+
+意味着 `teei_daemon` 不停向 TEE 发起读取，但每次都被信号中断。
+这可能是：
+
+1. 某个 TEE 服务未响应，daemon 在重试
+2. `teei_daemon` 自己收到信号后没正确处理 EINTR
+3. TEE 侧有服务挂起
+
+这个循环本身就是一个可观察的攻击面：`tz_vfs_read` 在
+`wait_for_completion_interruptible` 返回 `-ERESTARTSYS` 时没有清理状态，
+如果这个循环里存在资源泄漏（比如每次都分配一个 buffer 而不释放），
+长时间运行会耗尽某个池。但目前只看到错误日志，没有看到泄漏证据。
+
+## 十七、结论：静态线到此为止
+
+经过这一轮，可以明确给出结论：
+
+**从 EL1（即使有 root）无法静态读取 EL2 的内存。** 原因有三层：
+
+1. `gz_a` 在磁盘上是 AES 加密的，密钥在 eFuse，分区里没有
+2. EL2 的代码在运行时加载到 `0x38000000`，但 EL1 没有物理内存访问原语
+3. 唯一能看到 EL2 的窗口 `/proc/gz_log` 是一次性的，已耗尽
+
+**RKP 关闭这件事无法在 EL1 侧验证。** 这是一个真实的配置弱点
+（MTK 的 RKP 本可以在 EL2 侧保护密钥），但要利用它需要先有一个
+能读/写任意物理内存的 EL1 原语——而这台机恰好没有。
+
+换句话说：**RKP 缺失降低了攻击门槛，但还缺一把钥匙。**
+那把钥匙就是一个 EL1 的内核内存破坏漏洞（任意读/写）。
+有了它之后，RKP 缺失会让从 EL1 到 EL2 的跳跃变得可行；
+没有它，RKP 缺失只是个纸面弱点。
+
+## 十八、下一步真正的方向
+
+要突破 EL1 → EL2，必须先有 EL1 的任意读写。可选的路径：
+
+1. **`gz_ioctl` 的影子数组越界**（第四章那个 `cmp w9, #0x3ff` 的位置问题）。
+   这是 EL1 内核堆溢出，成功后有希望拿到任意读写。
+   需要写 PoC 在设备上跑，有崩溃风险。
+2. **`teei_daemon` 的 `tz_vfs_read` 循环**。如果存在 buffer 泄漏，
+   可能可以耗尽内存或触发 UAF。需要长时间观察。
+3. **`m4u` / `MTK_M4U=y` 的 IOMMU 路径**。`/dev/m4u` 若可访问，
+   IOMMU 映射错误可以给出物理内存访问。
+4. **已知的 MTK 内核 CVE**，kernel 4.19.191 且安全补丁 2026-05-01，
+   需要查这个版本之后公布的漏洞。
+
+前三条都需要动手写代码并在设备上执行。第四条是查资料。
+
+## 十九、待补
 
 - `mmcblk0boot0` / `boot1`（eMMC boot 分区，可能存 preloader 和密钥）
 - `otp` 分区（eFuse 的镜像，若可读则直接拿到 device key）
