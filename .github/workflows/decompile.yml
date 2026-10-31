@@ -1,0 +1,123 @@
+name: decompile
+
+on:
+  workflow_dispatch:
+    inputs:
+      target:
+        description: path or glob under work, default every apk/dex/jar/elf/dtb
+        required: false
+        default: ""
+      mode:
+        description: apk | elf | dtb | all
+        required: false
+        default: "all"
+
+permissions:
+  contents: read
+
+jobs:
+  decompile:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - name: deps
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq aapt apktool jadx dex2jar binutils-multiarch \
+            device-tree-compiler llvm python3-pip || true
+          python3 -m pip install --quiet capstone pyelftools
+          mkdir -p deps
+          if [ ! -x deps/jadx/bin/jadx ]; then
+            curl -sL -o deps/jadx.zip https://github.com/skylot/jadx/releases/download/v1.5.1/jadx-1.5.1.zip
+            unzip -q deps/jadx.zip -d deps/jadx
+          fi
+          deps/jadx/bin/jadx --version || true
+
+      - name: stage
+        run: |
+          mkdir -p work/in out
+          cd samples
+          for f in *; do
+            case "$f" in
+              *.gz|*.gzip) gunzip -c "$f" > "../work/in/${f%.gz}" ;;
+              *) cp "$f" "../work/in/$f" ;;
+            esac
+          done
+          ls -l ../work/in
+
+      - name: unpack with binwalk
+        run: |
+          for f in work/in/*; do
+            binwalk -eM --run-as=root "$f" > /dev/null 2>&1 || true
+          done
+          find . -maxdepth 1 -name "_*.extracted" -exec cp -r {} work/unpacked/ \; 2>/dev/null || true
+          rm -rf _*.extracted
+          find work -type f | head -200
+
+      - name: apk
+        if: inputs.mode == 'all' || inputs.mode == 'apk'
+        run: |
+          mkdir -p out/apk
+          find work -type f \( -name '*.apk' -o -name '*.jar' -o -name '*.zip' \) | while read -r f; do
+            n=$(basename "$f")
+            apktool d -f -o "out/apk/$n.smali" "$f" > /dev/null 2>&1 || true
+            deps/jadx/bin/jadx -d "out/apk/$n.java" --no-res "$f" > /dev/null 2>&1 || true
+          done
+          ls -R out/apk | head -100
+
+      - name: dex
+        if: inputs.mode == 'all' || inputs.mode == 'apk'
+        run: |
+          mkdir -p out/dex
+          find work -type f -name '*.dex' | while read -r f; do
+            deps/jadx/bin/jadx -d "out/dex/$(basename $f).java" --no-res "$f" > /dev/null 2>&1 || true
+          done
+
+      - name: elf
+        if: inputs.mode == 'all' || inputs.mode == 'elf'
+        run: |
+          mkdir -p out/elf
+          find work -type f | while read -r f; do
+            if [ "$(head -c 4 "$f" | od -An -tx1 | tr -d ' \n')" = "7f454c46" ]; then
+              n=$(basename "$f")
+              readelf -a -W "$f" > "out/elf/$n.readelf.txt" 2>&1
+              objdump -d -M intel "$f" > "out/elf/$n.objdump.txt" 2>&1
+              llvm-objdump -d --no-show-raw-insn "$f" > "out/elf/$n.llvm.txt" 2>&1 || true
+              nm -C "$f" > "out/elf/$n.nm.txt" 2>&1 || true
+            fi
+          done
+          ls -l out/elf | head -60
+
+      - name: dtb
+        if: inputs.mode == 'all' || inputs.mode == 'dtb'
+        run: |
+          mkdir -p out/dtb
+          find work -type f | while read -r f; do
+            magic=$(head -c 4 "$f" | od -An -tx1 | tr -d ' \n')
+            if [ "$magic" = "d00dfeed" ]; then
+              dtc -I dtb -O dts -o "out/dtb/$(basename $f).dts" "$f" 2>/dev/null || true
+            fi
+          done
+          ls -l out/dtb | head -40
+
+      - name: xref sift
+        if: inputs.mode == 'all' || inputs.mode == 'elf'
+        run: |
+          mkdir -p out/sift
+          find out/elf -name '*.objdump.txt' | while read -r f; do
+            grep -n -E 'svc|hvc|smc|mrs|msr|pacibsp|brk #' "$f" > "out/sift/$(basename $f).sysreg.txt" || true
+          done
+          wc -l out/sift/* 2>/dev/null | tail -20
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: decompile-${{ github.run_number }}
+          path: out/
+          retention-days: 30

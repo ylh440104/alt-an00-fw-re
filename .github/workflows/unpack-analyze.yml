@@ -1,0 +1,131 @@
+name: unpack-analyze
+
+on:
+  push:
+    paths:
+      - "samples/**"
+      - "tools/**"
+      - ".github/workflows/unpack-analyze.yml"
+  workflow_dispatch:
+    inputs:
+      sample:
+        description: single sample filename under samples/
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+jobs:
+  unpack:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: deps
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq binwalk p7zip-full file binutils-multiarch \
+            device-tree-compiler python3-pip squashfs-tools android-sdk-libsparse-utils || true
+          python3 -m pip install --quiet capstone pyelftools zstandard python-lz4 standalone
+
+      - name: stage samples
+        id: stage
+        run: |
+          mkdir -p work/in work/out
+          cd samples
+          for f in *; do
+            case "$f" in
+              *.gz|*.gzip) gunzip -c "$f" > "../work/in/${f%.gz}" ;;
+              *) cp "$f" "../work/in/$f" ;;
+            esac
+          done
+          ls -l ../work/in
+          echo "count=$(ls ../work/in | wc -l)" >> $GITHUB_OUTPUT
+
+      - name: identify
+        run: |
+          cd work/in
+          for f in *; do
+            echo "== $f"
+            file "$f"
+            sha256sum "$f"
+            md5sum "$f"
+          done
+
+      - name: structure report
+        run: |
+          python3 tools/inspect.py work/in/* | tee work/structure.md
+
+      - name: binwalk
+        run: |
+          for f in work/in/*; do
+            b=$(basename "$f")
+            echo "### $b" >> work/binwalk.md
+            binwalk -eM --run-as=root "$f" > work/binwalk_$b.txt 2>&1 || true
+            binwalk "$f" >> work/binwalk.md 2>&1 | head -200
+            tail -60 work/binwalk_$b.txt >> work/binwalk.md
+          done
+          mkdir -p work/unpacked
+          find _*.extracted -maxdepth 2 -exec cp -r {} work/unpacked/ \; 2>/dev/null || true
+          rm -rf _*.extracted
+
+      - name: archive listing
+        run: |
+          for f in work/in/*; do
+            echo "### 7z l $(basename $f)" >> work/archives.md
+            7z l "$f" >> work/archives.md 2>&1 | head -80
+          done
+
+      - name: strings
+        run: |
+          for f in work/in/*; do
+            strings -a -n 6 "$f" | head -400 > "work/strings_$(basename $f).txt"
+            strings -a -e l -n 6 "$f" | head -200 >> "work/strings_$(basename $f).txt"
+          done
+
+      - name: elf sweep
+        run: |
+          : > work/elf.md
+          find work/unpacked work/in -type f | while read -r f; do
+            if [ "$(head -c 4 "$f" | od -An -tx1 | tr -d ' \n')" = "7f454c46" ]; then
+              echo "## $f" >> work/elf.md
+              file "$f" >> work/elf.md
+              readelf -h "$f" >> work/elf.md 2>&1
+              readelf -S -W "$f" >> work/elf.md 2>&1 | head -80
+              objdump -d --no-show-raw-insn "$f" >> work/elf.md 2>&1 | head -1500
+            fi
+          done
+
+      - name: fdt sweep
+        run: |
+          find work/unpacked -name "*.dtb" | while read -r f; do
+            dtc -I dtb -O dts "$f" > "$f.dts" 2>/dev/null || true
+          done
+
+      - name: summary
+        run: |
+          {
+            echo "# unpack-analyze"
+            echo
+            echo "commit \`${GITHUB_SHA}\` run ${GITHUB_RUN_NUMBER}"
+            echo
+            for f in work/in/*; do
+              echo '```'
+              echo "\$ file $(basename $f)"; file "$f"
+              echo '```'
+            done
+            echo
+            cat work/structure.md
+            echo
+            echo "## binwalk"; cat work/binwalk.md 2>/dev/null | head -300
+            echo
+            echo "## archives"; cat work/archives.md 2>/dev/null | head -200
+          } >> $GITHUB_STEP_SUMMARY
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: unpack-analysis-${{ github.run_number }}
+          path: work/
+          retention-days: 30

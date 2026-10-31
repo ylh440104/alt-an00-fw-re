@@ -1,0 +1,6 @@
+work/
+out/
+deps/
+_*.extracted
+*.pyc
+__pycache__/
