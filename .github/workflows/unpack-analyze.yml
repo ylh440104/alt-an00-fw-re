@@ -25,10 +25,13 @@ jobs:
 
       - name: deps
         run: |
+          set +e
           sudo apt-get update -qq
-          sudo apt-get install -y -qq binwalk p7zip-full file binutils-multiarch \
-            device-tree-compiler python3-pip squashfs-tools android-sdk-libsparse-utils || true
-          python3 -m pip install --quiet capstone pyelftools zstandard python-lz4 standalone
+          sudo apt-get install -y -qq p7zip-full file binutils-multiarch device-tree-compiler python3-pip squashfs-tools zlib1g-dev > /dev/null 2>&1
+          sudo apt-get install -y -qq binwalk > /dev/null 2>&1 || pip install --break-system-packages -q binwalk || true
+          python3 -m pip install --break-system-packages -q capstone pyelftools zstandard lz4 2>&1 | tail -3
+          python3 -c "import capstone, elftools; print('capstone', capstone.__version__)"
+          binwalk --help 2>&1 | head -5 || true
 
       - name: stage samples
         id: stage
@@ -60,16 +63,24 @@ jobs:
 
       - name: binwalk
         run: |
+          HAVE=0
+          command -v binwalk > /dev/null && HAVE=1
+          echo "binwalk available: $HAVE" > work/binwalk.md
           for f in work/in/*; do
             b=$(basename "$f")
             echo "### $b" >> work/binwalk.md
-            binwalk -eM --run-as=root "$f" > work/binwalk_$b.txt 2>&1 || true
-            binwalk "$f" >> work/binwalk.md 2>&1 | head -200
-            tail -60 work/binwalk_$b.txt >> work/binwalk.md
+            if [ "$HAVE" = "1" ]; then
+              binwalk -eM --run-as=root "$f" > work/binwalk_$b.txt 2>&1 || true
+              binwalk "$f" >> work/binwalk.md 2>&1 | head -200
+              tail -60 work/binwalk_$b.txt >> work/binwalk.md
+            else
+              echo "skipped, binwalk not installed" >> work/binwalk.md
+            fi
           done
           mkdir -p work/unpacked
-          find _*.extracted -maxdepth 2 -exec cp -r {} work/unpacked/ \; 2>/dev/null || true
+          find . -maxdepth 2 -name "_*.extracted" -exec cp -r {} work/unpacked/ \; 2>/dev/null || true
           rm -rf _*.extracted
+          find work/unpacked -type f | head -100
 
       - name: archive listing
         run: |
