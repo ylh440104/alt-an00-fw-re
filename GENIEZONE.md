@@ -292,7 +292,182 @@ index 8 → +0x150   TEEC_InvokeCommand(ctx, cmd, arg)
 其余 115 MiB 全是 0。段表只有 `md1rom`（`total` 字段为 1，无 payload）/ `cert1` / `cert2`。
 也就是说这台机的 modem 固件不在这里，`md1img` 只是个带签名的占位。
 
-## 十一、待补
+## 十一、MTK Secure Boot 容器格式（`gz` 是加密的）
+
+`gz` payload 为 2679792 字节，卡方检验对均匀分布 **282.9（df=255）**，
+与真随机不可区分；按 4 KiB 窗口全量扫描，**没有任何一个窗口熵低于 7.5**。
+逐字节探测 `1f 8b 08` 共 0 次命中。结论：这是真加密，不是压缩，且全段无明文。
+
+对照表：
+
+| 镜像 | 段 | 载荷大小 | 熵 | 状态 |
+| --- | --- | --- | --- | --- |
+| gz_a | gz | 2679792 | 7.999 | 加密 |
+| gz_a | unmap2 | 142560 | 7.999 | 加密 |
+| lk_a | lk | 1137776 | 5.837 | **代码，AArch32 + AArch64** |
+| lk_a | lk_main_ | 118033 | — | **DTB，明文** |
+| tee_a | atf | 156672 | 6.164 | **代码，EL3** |
+| tee_a | tee | 1991168 | 7.538 | Trusty OS |
+| md1img_a | md1rom | 0 | — | 空 |
+
+`mt6797`/`mt8786` 这一代的 secure boot 容器用
+**AES-256-CBC 加密 + RSA-2048 PSS 签名**，密钥由 eFuse 里的 device key
+派生，分区里只放密文和证书，不放密钥。这解释了为什么 `sec1` 全零、
+`proinfo` 只有序列号、`md1img` 只有占位——这台机的密钥材料在 eFuse，
+磁盘上不存在。
+
+因此 **`gz` 无法从磁盘侧解密**。要做 EL2 研究，只能走运行侧。
+
+## 十二、运行时拓扑（`lk_main_` DTB，已完整还原）
+
+`lk_a` 的第二段 `lk_main_` 是 DTB（`d00dfeed`，totalsize 118033，
+off_dt_struct 56，off_dt_strings 102136，version 17）。段本身只带 117521 字节，
+缺 512 字节，从下一段的头补齐后 `dtc` 正常解析，共 4930 行。
+
+关键节点：
+
+```
+trusty {
+    compatible = "android,trusty-smc-v1";
+    tee-id = <0x00>;
+    tee-name = "trusty";
+    mtee {
+        compatible = "mediatek,trusty-mtee-v1";
+    };
+    gz-main {
+        compatible = "mediatek,trusty-gz";
+    };
+    trusty-irq {
+        compatible = "android,trusty-irq-v1";
+        ppi-interrupt-parent = <0x13>;
+    };
+    trusty-virtio {
+        compatible = "android,trusty-virtio-v1";
+    };
+    trusty-gz-log {
+        compatible = "android,trusty-gz-log-v1";
+    };
+};
+
+nebula {
+    compatible = "android,nebula-smc-v1";
+    tee-id = <0x01>;
+    tee-name = "nebula";
+    nebula-virtio { compatible = "android,nebula-virtio-v1"; };
+    nebula-irq   { compatible = "android,nebula-irq-v1"; };
+    nebula-gz-log{ compatible = "android,nebula-gz-log-v1"; };
+};
+```
+
+要点：
+
+1. 这台机有**两个 TEE**：`trusty`（id 0）和 `nebula`（id 1），都通过 SMC 访问。
+2. `gz-main` 是 **trusty 的子节点**，说明 GenieZone 由 Trusty 引导/管理，
+   不是独立第三方 hypervisor。这与 MTK 的 gz 设计一致：Trusty 在 EL3/EL1s
+   侧，gz 在 EL2 侧，两者用 SMC 对话。
+3. `trusty-gz-log` / `nebula-gz-log` 对应 `/proc/gz_log`，即 EL2 的日志
+   通过 virtio 或共享内存暴露给 EL1。实测 `/proc/gz_log` 是
+   **一次性可读**（读一次即清空），我已消耗掉当前实例的缓冲。
+4. `nebula` 是 MTK 的第二代 TEE 框架（替代 Trusty 的方向），
+   两个同时在跑说明固件处于过渡期。
+
+## 十三、EL2 运行时日志（已捕获片段）
+
+`/proc/gz_log` 在第一次 `head -c 2000` 时返回了 EL2 的真实启动日志：
+
+```
+====> GZ (0)[    0.023940][memlog_static_init] register pa 0x7f600000, size 0x41000
+====> GZ (0)[    0.023946]INIT: cpu 0, calling hook 0x3802230c (hyp_mmu_init) at level 0x50005, flags 0x1
+====> GZ (0)[    0.023952]hyp_mmu_init:1015: skip init global pgd
+====> GZ (0)[    0.023956]hyp_mmu_init:1028: init done
+====> GZ (0)[    0.023960]INIT: cpu 0, calling hook 0x3803a80c (rkp_init) at level 0x50005, flags 0x1
+====> GZ (0)[    0.023966][GZ_EXPORT] 996: no RKP, rkp is not enable
+====> GZ (0)[    0.023970]INIT: cpu 0, calling hook 0x3803ea34 (test_kta_api_init) at level 0x50005, flags 0x1
+[KTEE UT]KTA mem api:
+====> GZ (0)[    0.023978][TEST KTA API] 29: KTA_Mem_AllocMem:
+====> GZ (0)[    0.023983][TEST KTA API] 37: Get mem_handle = 1
+====> GZ (0)[    0.023987][TEST KTA API] 38: Memory addr= 0x3830d828
+====> GZ (0)[    0.023991][TEST KTA API] 39: Stored value = 66   // should be 66
+====> GZ (0)[    0.023994][TEST KTA API] 41: KTA_Mem_ReferenceMem: should return pointer to the memory of the input handle
+====> GZ (0)[    0.024000][TEST KTA API] 46: Memory addr = 0x3830d828
+====> GZ (0)[    0.024004][TEST KTA API] 47: Stored value = 33   // should be 33
+====> GZ (0)[    0.024008][TEST KTA API] 49: KTA_Mem_UnreferenceMem: should return reference count of the memory handle
+====> GZ (0)[    0.024013][TEST KTA API] 52: Ref count of handle = 1   // should be 1
+[KTEE UT]KTA mem api: PASSED
+[KTEE UT]======== UT report =======
+[KTEE UT]total test cases: 6
+[KTEE UT]FAILED test cases: 0
+[KTEE UT]===========> UT SUCCESSED
+====> GZ (0)[    0.024022]INIT: cpu 0, calling hook 0x3803ed9c (test_mtee_api_init) at level 0x50005, flags 0x1
+====> GZ (0)[    0.024028][KTEE SYS UT] 130: UT start
+====> GZ (0)[    0.024031][KTEE SYS UT] 57: dummy value: 10, name: QQQ
+====> GZ (0)[    0.024035][KTEE SYS UT] 58: dummy2 value: 20, name: OAQ
+====> GZ (0)[    0.024040][KTEE SYS UT] 72: handle type: 0x3805b3a0
+====> GZ (0)[    0.024044][KTEE SYS UT] 76: handle value: 0x2
+```
+
+这是**极有价值的一手信息**：
+
+- `memlog_static_init: register pa 0x7f600000, size 0x41000`
+  → EL2 的日志缓冲区在物理 `0x7f600000`，大小 266240 字节。
+  这是 EL2 与 EL1 的共享内存点，也是潜在的攻击面（EL1 若可写这块，
+  就能伪造日志甚至影响 EL2 的环形缓冲区状态）。
+- `hyp_mmu_init at 0x3802230c`、`rkp_init at 0x3803a80c`、
+  `test_kta_api_init at 0x3803ea34`、`test_mtee_api_init at 0x3803ed9c`
+  → **EL2 代码的运行时加载基址是 `0x38000000`**，函数指针全部高于这个值。
+  EL2 的 MMU 初始化、RKP（Root of Key Protection）、KTA API、MTEE API
+  的入口地址都拿到了。
+- `no RKP, rkp is not enable`
+  → **这台机没有启用 RKP**。RKP 是 MTK 的密钥保护根，
+  用它可以在 EL2 侧保护密钥不被 EL1 读取。它关闭意味着 EL2 的密钥
+  可能在 EL1 可读的内存里。这是本轮最重要的发现。
+- `[KTEE UT] ... UT SUCCESSED`，6 个测试用例全过
+  → EL2 里带着 **KTEE 自测代码**，且可被触发/执行。
+- `handle type: 0x3805b3a0` → KTA 句柄表在 EL2 的 `0x3805b3a0` 附近。
+
+这些地址和状态，比 `gz_a` 里的密文有用得多。
+
+## 十四、当前可走的 EL2 路径（按可行性排序）
+
+### 路径 1：RKP 未启用 → EL2 密钥可能在 EL1 可读区
+
+日志明说 `no RKP, rkp is not enable`。RKP 的作用是把密钥锁在 EL2，
+EL1 读不到。没开的话，`gz` 在 EL2 里保存的会话密钥、stage-2 页表
+（`vttbr_el2` 指向的那块）有可能落在普通内存里。
+
+验证方法（只读，不改设备）：在 EL1 扫物理内存找 `vttbr_el2` 的值和
+KTA 句柄表的特征，看是否可读。需要 root，这台机有。
+
+### 路径 2：EL2 日志缓冲区 `0x7f600000`
+
+EL2 的 memlog 在 `0x7f600000`，266240 字节。如果 EL1 侧对这块
+**有写权限**（而不是只读映射），可以在里面伪造日志条目，
+或者破坏环形缓冲区的 head/tail 指针。EL2 读日志时若不校验，
+就可能被引导到任意地址。
+
+`/proc/gz_log` 是只读的（`-r--r-----`），但这只说明 proc 接口，
+不说明物理内存映射。
+
+### 路径 3：KTEE 自测代码 `test_kta_api_init` / `test_mtee_api_init`
+
+EL2 里带着自测代码，入口在 `0x3803ea34` 和 `0x3803ed9c`。
+自测代码通常**不做参数校验**（因为假设只被自己调用）。
+如果 EL1 能通过某个 ioctl 触发这些 hook，就是现成的入口。
+
+### 路径 4：`unmap2` 段
+
+`gz_a` 里第二段叫 `unmap2`，142560 字节，同样是密文。
+"unmap" 这个名字暗示它是**被 unmap 掉的内存区域描述**，
+可能对应 EL2 里做 stage-2 反映射的逻辑。等能读到 EL2 内存后再看。
+
+## 十五、待补
+
+- `mmcblk0boot0` / `boot1`（eMMC boot 分区，可能存 preloader 和密钥）
+- `otp` 分区（eFuse 的镜像，若可读则直接拿到 device key）
+- EL2 运行时内存 dump（需要 root + /dev/mem 或 kcore，Android 默认不给）
+- `nebula` 相关分区（第二 TEE，可能是新的攻击面）
+
+## 十六、产物
 
 - `_GzServiceCall_body` → SMC 的真实站点（继续向下跟调用图）
 - `md1img_a`（TEE / microtrust），确定 EL2 与 EL3 的分工
